@@ -46,6 +46,11 @@ import re
 import shlex
 from itertools import islice, chain
 import math
+import fnmatch
+import email
+import email.parser
+import email.errors
+import email.utils
 
 try:
   import json as simplejson
@@ -68,7 +73,7 @@ def SetupOptionParser():
   parser.add_option('--email',
     dest='email',
     help='Full email address of user or group to act against')
-  action_choices = ['backup','restore', 'restore-group', 'count', 'purge', 'estimate', 'reindex']
+  action_choices = ['backup','restore', 'restore-group', 'count', 'purge', 'estimate', 'reindex', 'import-eml']
   parser.add_option('--action',
     type='choice',
     choices=action_choices,
@@ -83,6 +88,12 @@ def SetupOptionParser():
     dest='local_folder',
     help='Optional: On backup, restore, estimate, local folder to use. Default is GYB-GMail-Backup-<email>',
     default='XXXuse-email-addressXXX')
+  parser.add_option('--eml-folder',
+    dest='eml_folder',
+    help='Folder to search recursively for EML files to import. The messages are imported onto the web server and are not stored locally. The "Inbox" label is automatically applied. An additional label may be specified with "--label-eml".')
+  parser.add_option('--label-eml',
+    dest='label_eml',
+    help='Optional: On import of EML files, all messages will additionally receive this label. For example, "--label-eml gyb-eml" will label all uploaded messages with a gyb-eml label.')
   parser.add_option('--use-imap-folder',
     dest='use_folder',
     help='Optional: IMAP folder to act against. Default is "All Mail" label. You can run "--use_folder [Gmail]/Chats" to backup chat.')
@@ -508,7 +519,7 @@ def main(argv):
   newDB = (not os.path.isfile(sqldbfile)) and (options.action == 'backup')
   
   #If we're not doing a estimate or if the db file actually exists we open it (creates db if it doesn't exist)
-  if options.action not in ['estimate', 'count', 'purge'] or os.path.isfile(sqldbfile):
+  if options.action not in ['estimate', 'count', 'purge', 'import-eml'] or os.path.isfile(sqldbfile):
     print "\nUsing backup folder %s" % options.local_folder
     global sqlconn
     global sqlcur
@@ -997,6 +1008,106 @@ def main(argv):
       sys.stdout.flush()
       time.sleep(1)
     print ""
+
+  # IMPORT-EML #
+  elif options.action == 'import-eml':
+    '''This option is used to recursively import EML files starting in a root directory.
+    
+    This chooses files based on file extension only (.eml), making no attempt to check the file type.
+    This uses a crude parsing 
+    Malformed messages will cause the program to exit.
+    This does not attempt to prevent duplicates from being uploaded, nor does it keep track of progress.
+    
+    Author: Eric Subach (eric.subach@gmail.com)
+    '''
+
+    if not options.eml_folder:
+      print "Error: --eml-folder is required when using the import-eml action."
+      return
+
+    print 'Recursively importing all EML files in directory "%s".' % options.eml_folder
+    
+    if options.label_eml:
+      print 'Will also apply the label "%s" to all imported messages.' % options.label_eml
+
+    if options.use_folder:
+      imapconn.select(options.use_folder)
+    else:
+      imapconn.select(ALL_MAIL)  # read/write!
+
+    current = 0
+
+    # Recursively find all messages from specified folder.
+    for root, dirs, filenames in os.walk(options.eml_folder):
+      for filename in filenames:
+        if fnmatch.fnmatch(filename, '*.eml'):
+          restart_line()
+          current += 1
+          sys.stdout.write("Importing EML message #%s at location '%s'." % (current, os.path.join(root, filename)))
+          sys.stdout.flush()
+
+          try:
+            with open(os.path.join(root, filename), 'rb') as file:
+              full_message = file.read()
+              file.seek(0)
+              message = email.message_from_file(file)
+          except IOError:
+            print 'Error: Error opening file.'
+            continue
+          except email.errors.MessageError:
+            print 'Error: Problem parsing the message in the file.'
+            continue
+
+          try:
+            # Use the original send date.
+            message_datestring = message['Date']
+          except:
+            print "Error: Couldn't find date in message."
+            continue
+
+          message_internaldate_tuple = email.utils.parsedate(message_datestring)
+          if message_internaldate_tuple is None:
+            print "Error: Couldn't parse the message date."
+            continue
+
+          message_internaldate_seconds = time.mktime(message_internaldate_tuple)
+          
+          # Apply Inbox label by default.
+          labels_results = [['\Inbox']]
+          labels = []
+          for l in labels_results:
+            labels.append(l[0].replace('\\','\\\\').replace('"','\\"'))
+          # Apply user-specified label, if applicable.
+          if options.label_eml:
+            labels.append(options.label_eml)
+          flags_results = []
+          flags = []
+          for f in flags_results:
+            flags.append(f[0])
+          flags_string = ' '.join(flags)
+          while True:
+            try:
+              r, d = imapconn.append(ALL_MAIL, flags_string, message_internaldate_seconds, full_message)
+              if r != 'OK':
+                print '\nError: %s %s' % (r,d)
+                sys.exit(5)
+              restored_uid = int(re.search('^[APPENDUID [0-9]* ([0-9]*)] \(Success\)$', d[0]).group(1))
+              if len(labels) > 0:
+                labels_string = '("'+'" "'.join(labels)+'")'
+                r, d = imapconn.uid('STORE', restored_uid, '+X-GM-LABELS', labels_string)
+                if r != 'OK':
+                  print '\nGImap Set Message Labels Failed: %s %s' % (r, d)
+                  sys.exit(33)
+              break
+            except imaplib.IMAP4.abort, e:
+              print '\nimaplib.abort error:%s, retrying...' % e
+              imapconn = gimaplib.ImapConnect(generateXOAuthString(options.email, options.service_account), options.debug)
+              imapconn.select(ALL_MAIL)
+            except socket.error, e:
+              print '\nsocket.error:%s, retrying...' % e
+              imapconn = gimaplib.ImapConnect(generateXOAuthString(options.email, options.service_account), options.debug)
+              imapconn.select(ALL_MAIL)
+
   try:
     sqlconn.close()
   except NameError:
